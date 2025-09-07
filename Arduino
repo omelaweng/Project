@@ -1,0 +1,132 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+#define RXD2 16
+#define TXD2 17
+#define PUMP_PIN 25
+#define LED_DRY 26
+#define LED_NORMAL 14
+#define LED_WET 27
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ✅ ใส่ Wi-Fi ที่จะเชื่อม (Hotspot ก็ได้)
+#define WIFI_SSID "ชื่อ-WiFi"
+#define WIFI_PASSWORD "รหัสผ่าน-WiFi"
+
+// ✅ ใส่ Firebase Config ของคุณตรงนี้
+#define API_KEY "AIzaSyXXXXXXX"
+#define DATABASE_URL "https://xxx.firebaseio.com"  // อย่าลืมเปลี่ยน
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+int moisture = 0;
+int soilStatus = 0;
+int pumpStatus = 0;
+bool autoMode = true;
+bool commandPump = false;
+
+unsigned long lastSend = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  lcd.init(); lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("Connecting WiFi");
+
+  pinMode(PUMP_PIN, OUTPUT);
+  pinMode(LED_DRY, OUTPUT);
+  pinMode(LED_NORMAL, OUTPUT);
+  pinMode(LED_WET, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("WiFi OK: ");
+  lcd.setCursor(0, 1); lcd.print(WiFi.localIP());
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+  // === อ่านค่าจาก Arduino UNO ผ่าน Serial2
+  if (Serial2.available()) {
+    String input = Serial2.readStringUntil('\n');
+    int idx = input.indexOf(':');
+    if (idx != -1) {
+      String valStr = input.substring(idx + 1);
+      valStr.trim();
+      moisture = valStr.toInt();
+    }
+
+    // อัปเดตสถานะดิน
+    if (moisture < 30) soilStatus = 1;
+    else if (moisture > 60) soilStatus = 3;
+    else soilStatus = 2;
+
+    // อ่านค่าจาก Firebase
+    Firebase.RTDB.getBool(&fbdo, "/autoMode");
+    autoMode = fbdo.boolData();
+
+    Firebase.RTDB.getBool(&fbdo, "/commandPump");
+    commandPump = fbdo.boolData();
+
+    // === ทำงานตามโหมด
+    if (autoMode) {
+      if (moisture < 30) setPump(true);
+      else setPump(false);
+    } else {
+      setPump(commandPump); // สั่งงานจากเว็บ
+    }
+
+    updateLCD();
+    updateLEDs();
+
+    // === ส่งค่าขึ้น Firebase
+    if (millis() - lastSend > 5000) {
+      Firebase.RTDB.setInt(&fbdo, "/moisture", moisture);
+      Firebase.RTDB.setInt(&fbdo, "/soilStatus", soilStatus);
+      Firebase.RTDB.setInt(&fbdo, "/pumpStatus", pumpStatus);
+      lastSend = millis();
+    }
+  }
+}
+
+void setPump(bool on) {
+  digitalWrite(PUMP_PIN, on ? HIGH : LOW);
+  pumpStatus = on ? 1 : 0;
+}
+
+void updateLEDs() {
+  digitalWrite(LED_DRY, soilStatus == 1 ? HIGH : LOW);
+  digitalWrite(LED_NORMAL, soilStatus == 2 ? HIGH : LOW);
+  digitalWrite(LED_WET, soilStatus == 3 ? HIGH : LOW);
+}
+
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Moisture: " + String(moisture));
+  lcd.setCursor(0, 1);
+  switch (soilStatus) {
+    case 1: lcd.print("Soil: DRY"); break;
+    case 2: lcd.print("Soil: NORMAL"); break;
+    case 3: lcd.print("Soil: WET"); break;
+  }
+  lcd.setCursor(0, 2); lcd.print("Pump: " + String(pumpStatus == 1 ? "ON" : "OFF"));
+  lcd.setCursor(0, 3); lcd.print("Mode: " + String(autoMode ? "AUTO" : "MANUAL"));
+}
