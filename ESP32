@@ -1,0 +1,382 @@
+#include <Arduino.h>  // เผื่อ IDE บางตัวต้องการ
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include <Firebase_ESP_Client.h>   // Firebase ESP32 library
+
+// ==== Firebase Config ====
+#define API_KEY "AIzaSyCpVAH9jcUS-aTLlpjGNQJypm8a7g1xH88"
+#define DATABASE_URL "https://soilmonitoresp32-default-rtdb.firebaseio.com/"
+
+// ==== Firebase objects ====
+FirebaseData fbdo;
+FirebaseAuth auth;     // ถ้าไม่ใช้ Authentication ให้เว้นว่างไว้
+FirebaseConfig config;
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+#define RXD2 16
+#define TXD2 17
+#define LED_DRY 26
+#define LED_NORMAL 14
+#define LED_WET 27
+#define PUMP_PIN 25
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+WiFiManager wm;
+WebServer server(80);
+
+int moisture = 0;
+int soilStatus = 0;
+int pumpStatus = 0;
+bool autoMode = true;
+
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 20000;  // 20 วินาที
+
+// ThingSpeak Config
+String apiKey = "8NOERMP6IH5TY85Y";
+String channelID = "3036083";
+String serverName = "http://api.thingspeak.com/update";
+
+// ===== Function Prototypes =====
+void handleRoot();
+void handleTogglePump();
+void handleToggleMode();
+void handleData();
+void sendToThingSpeak(int moistureVal, int soilStatusVal, int pumpStatusVal);
+void setPumpState(bool on);
+void updateLEDs();
+void updateLCD();
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  pinMode(LED_DRY, OUTPUT);
+  pinMode(LED_NORMAL, OUTPUT);
+  pinMode(LED_WET, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Starting system...");
+
+  // เชื่อม WiFi ผ่าน WiFiManager
+  bool res = wm.autoConnect("ESP32-Setup", "12345678");
+  if (!res) {
+    Serial.println("WiFi Failed. Restarting...");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed!");
+    delay(3000);
+    ESP.restart();
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connected");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+  Serial.print("Connected IP: ");
+  Serial.println(WiFi.localIP());
+  delay(2000);
+
+  // เริ่มต้น Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  if (!MDNS.begin("esp32")) {
+    Serial.println("Error setting up MDNS responder!");
+  } else {
+    Serial.println("mDNS responder started");
+  }
+
+  // กำหนด routing ของ web server
+  server.on("/", handleRoot);
+  server.on("/togglePump", HTTP_POST, handleTogglePump);
+  server.on("/toggleMode", HTTP_POST, handleToggleMode);
+  server.on("/data", HTTP_GET, handleData);
+
+  server.begin();
+  Serial.println("Web Server Started");
+}
+
+void loop() {
+  // อ่านข้อมูลจาก Arduino UNO ผ่าน Serial2
+  if (Serial2.available()) {
+    String input = Serial2.readStringUntil('\n');
+    Serial.println("From UNO: " + input);
+
+    int idx = input.indexOf(':');
+    if (idx != -1) {
+      String valStr = input.substring(idx + 1);
+      valStr.trim();
+      moisture = valStr.toInt();
+    }
+
+    // ควบคุมปั๊มและสถานะดินชื้นตามโหมด
+    if (autoMode) {
+      if (moisture < 30) {
+        setPumpState(true);
+        soilStatus = 1; // แห้ง
+      } else if (moisture > 60) {
+        setPumpState(false);
+        soilStatus = 3; // เปียก
+      } else {
+        setPumpState(false);
+        soilStatus = 2; // ปกติ
+      }
+    } else {
+      setPumpState(pumpStatus == 1);
+      if (moisture < 30) soilStatus = 1;
+      else if (moisture > 60) soilStatus = 3;
+      else soilStatus = 2;
+    }
+
+    updateLEDs();
+    updateLCD();
+
+    // ส่งข้อมูลทุก 20 วินาที
+    if (millis() - lastSendTime > sendInterval) {
+      sendToThingSpeak(moisture, soilStatus, pumpStatus);
+
+      // ส่งข้อมูลไป Firebase
+      Firebase.RTDB.setInt(&fbdo, "/moisture", moisture);
+      Firebase.RTDB.setInt(&fbdo, "/soilStatus", soilStatus);
+      Firebase.RTDB.setInt(&fbdo, "/pumpStatus", pumpStatus);
+      Firebase.RTDB.setBool(&fbdo, "/autoMode", autoMode);
+
+      Serial.println("📤 Sent to Firebase");
+
+      lastSendTime = millis();
+    }
+  }
+
+  // อ่านคำสั่งจาก Firebase (ถ้ามี)
+  if (Firebase.RTDB.getBool(&fbdo, "/commandPump")) {
+    bool commandPump = fbdo.boolData();
+    if (!autoMode && pumpStatus != (commandPump ? 1 : 0)) {
+      pumpStatus = commandPump ? 1 : 0;
+      setPumpState(commandPump);
+      updateLEDs();
+      updateLCD();
+      Serial.printf("Pump command from Firebase: %s\n", commandPump ? "ON" : "OFF");
+    }
+  }
+
+  if (Firebase.RTDB.getBool(&fbdo, "/commandMode")) {
+    bool commandMode = fbdo.boolData();
+    if (autoMode != commandMode) {
+      autoMode = commandMode;
+      Serial.printf("Mode command from Firebase: %s\n", autoMode ? "AUTO" : "MANUAL");
+      updateLEDs();
+      updateLCD();
+    }
+  }
+
+  server.handleClient();
+  delay(300);
+}
+
+// ===== Function Implementations =====
+
+void setPumpState(bool on) {
+  digitalWrite(PUMP_PIN, on ? HIGH : LOW);
+  pumpStatus = on ? 1 : 0;
+}
+
+void updateLEDs() {
+  digitalWrite(LED_DRY, soilStatus == 1 ? HIGH : LOW);
+  digitalWrite(LED_NORMAL, soilStatus == 2 ? HIGH : LOW);
+  digitalWrite(LED_WET, soilStatus == 3 ? HIGH : LOW);
+}
+
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Moisture: " + String(moisture) + "%");
+
+  lcd.setCursor(0, 1);
+  switch (soilStatus) {
+    case 1: lcd.print("Soil: DRY"); break;
+    case 2: lcd.print("Soil: NORMAL"); break;
+    case 3: lcd.print("Soil: WET"); break;
+    default: lcd.print("Soil: UNKNOWN"); break;
+  }
+
+  lcd.setCursor(0, 2);
+  lcd.print("Pump: ");
+  lcd.print(pumpStatus == 1 ? "ON " : "OFF");
+
+  lcd.setCursor(0, 3);
+  lcd.print("Mode: ");
+  lcd.print(autoMode ? "AUTO" : "MANUAL");
+}
+
+// ===== Web Handlers =====
+
+void handleRoot() {
+  String html = R"=====( 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Takanchan Garden - Soil Moisture Monitoring</title>
+  <style>
+    /* ใส่ CSS ตามต้องการ */
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f4f7f6; }
+    h1 { color: #2c3e50; }
+    .container { max-width: 600px; margin: auto; background: white; padding: 20px; border-radius: 8px; }
+    .status { margin: 10px 0; font-size: 1.2em; }
+    button { padding: 10px 20px; font-size: 1em; margin: 5px; cursor: pointer; background-color: #e67e22; color: white; border: none; border-radius: 5px; }
+    button:disabled { background-color: #ccc; cursor: not-allowed; }
+    iframe { width: 100%; border: none; margin-top: 10px; }
+    footer { text-align: center; margin-top: 20px; font-size: 0.9em; color: #555; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Takanchan Garden 🌿</h1>
+    <img src="https://images.unsplash.com/photo-1506744038136-46273834b3fb?auto=format&fit=crop&w=600&q=80" alt="Garden Image" style="width:100%; border-radius:8px;" />
+  </header>
+
+  <div class="container">
+    <div class="status">
+      <strong>Moisture:</strong> <span id="moisture">--</span>%
+    </div>
+    <div class="status">
+      <strong>Status:</strong> <span id="soilStatus">--</span>
+    </div>
+    <div class="status">
+      <strong>Pump:</strong> <span id="pumpStatus">--</span>
+    </div>
+    <div class="status">
+      <strong>Mode:</strong> <span id="mode">--</span>
+    </div>
+
+    <form action="/toggleMode" method="POST">
+      <button type="submit" id="modeBtn">Toggle Mode</button>
+    </form>
+
+    <form action="/togglePump" method="POST" id="pumpForm">
+      <button type="submit" id="pumpBtn">Toggle Pump</button>
+    </form>
+
+    <h2>📊 ThingSpeak Graphs</h2>
+    <iframe src="https://thingspeak.com/channels/3036083/charts/1?dynamic=true&results=50&color=%23007bff&height=300&title=Soil+Moisture" title="Soil Moisture Chart" height="300"></iframe>
+    <iframe src="https://thingspeak.com/channels/3036083/charts/2?dynamic=true&results=50&color=%23e67e22&height=300&title=Soil+Status" title="Soil Status Chart" height="300"></iframe>
+    <iframe src="https://thingspeak.com/channels/3036083/charts/3?dynamic=true&results=50&color=%232ecc71&height=300&title=Pump+Status" title="Pump Status Chart" height="300"></iframe>
+  </div>
+
+  <footer>
+    IP Address: )=====";
+  html += WiFi.localIP().toString();
+  html += R"=====( 
+  </footer>
+
+  <script>
+    function updateData() {
+      fetch("/data")
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById("moisture").innerText = data.moisture;
+
+          let statusSpan = document.getElementById("soilStatus");
+          if (data.soilStatus == 1)
+            statusSpan.innerHTML = "🌵 <span style='color:#d35400;'>DRY</span>";
+          else if (data.soilStatus == 2)
+            statusSpan.innerHTML = "🌿 <span style='color:#27ae60;'>NORMAL</span>";
+          else if (data.soilStatus == 3)
+            statusSpan.innerHTML = "💧 <span style='color:#2980b9;'>WET</span>";
+          else statusSpan.innerText = "UNKNOWN";
+
+          document.getElementById("pumpStatus").innerText = data.pumpStatus == 1 ? "ON" : "OFF";
+          document.getElementById("mode").innerText = data.autoMode ? "AUTO" : "MANUAL";
+
+          // Disable pump button if in auto mode
+          document.getElementById("pumpBtn").disabled = data.autoMode;
+          document.getElementById("pumpBtn").style.backgroundColor = data.autoMode ? "#ccc" : "#e67e22";
+        })
+        .catch(e => console.error(e));
+    }
+
+    setInterval(updateData, 1000);
+    updateData();
+  </script>
+</body>
+</html>
+)=====";
+
+  server.send(200, "text/html", html);
+}
+
+void handleTogglePump() {
+  if (!autoMode) {
+    pumpStatus = (pumpStatus == 1) ? 0 : 1;
+    setPumpState(pumpStatus == 1);
+
+    // อัปเดตสถานะคำสั่ง Firebase
+    Firebase.RTDB.setBool(&fbdo, "/commandPump", pumpStatus == 1);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleToggleMode() {
+  autoMode = !autoMode;
+
+  // อัปเดตสถานะคำสั่ง Firebase
+  Firebase.RTDB.setBool(&fbdo, "/commandMode", autoMode);
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"moisture\":" + String(moisture) + ",";
+  json += "\"soilStatus\":" + String(soilStatus) + ",";
+  json += "\"pumpStatus\":" + String(pumpStatus) + ",";
+  json += "\"autoMode\":" + String(autoMode ? "true" : "false");
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ===== ThingSpeak ส่งข้อมูล =====
+void sendToThingSpeak(int moistureVal, int soilStatusVal, int pumpStatusVal) {
+  if ((WiFi.status() == WL_CONNECTED)) {
+    HTTPClient http;
+    String serverPath = serverName + "?api_key=" + apiKey +
+                        "&field1=" + String(moistureVal) +
+                        "&field2=" + String(soilStatusVal) +
+                        "&field3=" + String(pumpStatusVal);
+
+    http.begin(serverPath.c_str());
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("ThingSpeak Response: " + response);
+    } else {
+      Serial.println("Error sending to ThingSpeak: " + String(httpResponseCode));
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
+}
