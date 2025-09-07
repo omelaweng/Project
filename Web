@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Soil Monitor</title>
+  <script src="https://www.gstatic.com/firebasejs/9.22.1/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js"></script>
+</head>
+<body>
+  <h2>🌱 Soil Monitor Control Panel</h2>
+  <div>
+    Moisture: <span id="moisture">--</span>% <br/>
+    Soil Status: <span id="soilStatus">--</span> <br/>
+    Pump: <span id="pumpStatus">--</span> <br/>
+    Mode: <span id="mode">--</span>
+  </div>
+
+  <button onclick="toggleMode()">Toggle Mode</button>
+  <button onclick="togglePump()" id="pumpBtn">Toggle Pump</button>
+
+  <script>
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "xxx.firebaseapp.com",
+      databaseURL: "https://xxx.firebaseio.com",
+      projectId: "xxx",
+      storageBucket: "xxx.appspot.com",
+      messagingSenderId: "xxx",
+      appId: "xxx"
+    };
+
+    const app = firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    function updateUI(snapshot) {
+      const data = snapshot.val();
+      document.getElementById("moisture").innerText = data.moisture;
+      document.getElementById("soilStatus").innerText =
+        data.soilStatus == 1 ? "DRY" : data.soilStatus == 2 ? "NORMAL" : "WET";
+      document.getElementById("pumpStatus").innerText = data.pumpStatus ? "ON" : "OFF";
+      document.getElementById("mode").innerText = data.autoMode ? "AUTO" : "MANUAL";
+
+      document.getElementById("pumpBtn").style.display = data.autoMode ? "none" : "inline-block";
+    }
+
+    db.ref().on("value", updateUI);
+
+    function toggleMode() {
+      db.ref("autoMode").get().then(snap => {
+        db.ref("autoMode").set(!snap.val());
+      });
+    }
+
+    function togglePump() {
+      db.ref("commandPump").get().then(snap => {
+        db.ref("commandPump").set(!snap.val());
+      });
+    }
+  </script>
+</body>
+</html>
